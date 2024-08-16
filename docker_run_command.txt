@@ -1,0 +1,2 @@
+cd docker-mavros
+docker run -it --rm --env FCUURL="/dev/ttyAMA0:57600" --privileged -v /dev:/dev -env STARTDELAY=0 mavros
