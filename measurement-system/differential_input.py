@@ -22,7 +22,9 @@ from multiprocessing import Queue, Process
 #Imports for server
 import socket
 import threading
-import socketserver
+from socketserver import ThreadingTCPServer, StreamRequestHandler
+import io 
+import struct 
 
 #DAQ Settings
 SAMPLE_FREQUENCY = 1000.0 #Hz
@@ -36,8 +38,11 @@ DATA_DIR.mkdir(parents = True, exist_ok=True)
 #Output file name
 OUTPUT_FILE = DATA_DIR / 'sound_levels_test.txt'
 
+#Server settings
+PORT = 8000
 
 
+#Class to handle DAQ i/o - call read_data to return an array of data
 class DAQHandler():
     def __init__(self):
         #Inherit process function 
@@ -48,6 +53,8 @@ class DAQHandler():
 
     #Setup the DAQ device  
     def setup_daq(self):
+        print('[DAQ] Setting up the DAQ System')
+
         # Store the channels in a list and convert the list to a channel mask that
         # can be passed as a parameter to the MCC 128 functions.
         self.channel_mask = chan_list_to_mask(CHANNELS)
@@ -65,11 +72,10 @@ class DAQHandler():
         self.hat.a_in_mode_write(input_mode)
         self.hat.a_in_range_write(input_range)
 
-        #Set default options
-        options = OptionFlags.DEFAULT
+        #Set continuous scan
+        options = OptionFlags.CONTINUOUS
 
-
-        print('\nSelected MCC 128 HAT device at address', self.address)
+        print('\n [DAQ] Selected MCC 128 HAT device at address', self.address)
 
         actual_scan_rate = self.hat.a_in_scan_actual_rate(self.num_channels, SAMPLE_FREQUENCY)
 
@@ -85,9 +91,7 @@ class DAQHandler():
 
 
     def read_data(self):
-
         #Hardcoded read parameter 
-        total_samples_read = 0
         read_request_size = 1
         timeout = 5.0
         read_result = self.hat.a_in_scan_read(read_request_size, timeout)
@@ -95,15 +99,38 @@ class DAQHandler():
         # Check for an overrun error
         if read_result.hardware_overrun:
             print('\n\nHardware overrun\n')
-            return 1 
+            
+            return np.array([1]) 
+
         elif read_result.buffer_overrun:
             print('\n\nBuffer overrun\n')
-            return 1 
+            self.stop_hat()
+            self.setup_daq()
+            
+            return np.array([1])
 
+        #Create zero array with data
+        data_array = np.zeros((4, 1))     
 
-        return data
+        samples_read_per_channel = int(len(read_result.data) / self.num_channels)
 
-    def read_and_display_data(self):
+        if samples_read_per_channel > 0:
+            index = samples_read_per_channel * self.num_channels - self.num_channels
+
+            # timestamp = datetime.now().strftime("%H:%M:%S") # lit la date (pas besoin)
+
+            #Create zero array with data
+            sound_level = np.zeros((4, 1)) 
+            
+            for i in range(self.num_channels):                                            
+
+                #Append to numpy array
+                data_array[i] = read_result.data[index + i]           
+      
+
+        return data_array
+
+    def record_data(self):
         """
         Reads data from the specified channels on the specified DAQ HAT devices
         and updates the data on the terminal display.  The reads are executed in a
@@ -120,50 +147,28 @@ class DAQHandler():
 
         """
 
+        total_samples_read = 0
+        read_request_size = 1
 
+        print('[DAQ] Recording ')
+       
+        #Write header file
+        with open(OUTPUT_FILE, 'w') as f:      
+            f.write("Timestamp,Sound Lvl ch.0 (V),Sound Lvl ch.1 (V),Sound Lvl ch.2 (V),Sound Lvl ch.3 (V)\n")
 
-        # Continuously update the display value until Ctrl-C is pressed
-        # or the number of samples requested has been read.
         while total_samples_read < SAMPLE_NUMBER:
-            #Get reading 
-            read_result = self.hat.a_in_scan_read(read_request_size, timeout)
+            #Read data
+            data = self.read_data() 
 
-            # Check for an overrun error
-            if read_result.hardware_overrun:
-                print('\n\nHardware overrun\n')
-                break
-            elif read_result.buffer_overrun:
-                print('\n\nBuffer overrun\n')
-                break
-
-            samples_read_per_channel = int(len(read_result.data) / self.num_channels)
-            total_samples_read += samples_read_per_channel
-
-            # Display the last sample for each channel.
-            print('\r{:12}'.format(samples_read_per_channel),
-                ' {:12} '.format(total_samples_read), end='')
-
-            if samples_read_per_channel > 0:
-                index = samples_read_per_channel * self.num_channels - self.num_channels
-
-                # timestamp = datetime.now().strftime("%H:%M:%S") # lit la date (pas besoin)
-                sound_level = np.zeros((4, 1))      # array de taille 4,1 remplit de 0
-                
-                for i in range(self.num_channels):
+            #Write results to output file
+            with open(OUTPUT_FILE, 'a') as f:
+                np.savetxt(f,data.T,fmt='%6e',delimiter=',')
+            
+            total_samples_read+=1 
                     
-                    print('{:10.5f}'.format(read_result.data[index + i]), 'V ',
-                        end='')                                                   
-
-                    #Append to numpy array
-                    sound_level[i] = read_result.data[index + i]           
-
-                #Write results to output file
-                with open(OUTPUT_FILE, 'a') as f:
-                    np.savetxt(f,sound_level.T,fmt='%6e',delimiter=',')
-                    
-                stdout.flush()
-
         print('\n')
+
+        print('[DAQ] Finished Recording')
 
     def stop_hat(self):
         #Cleanup and stop hat 
@@ -171,98 +176,93 @@ class DAQHandler():
         self.hat.a_in_scan_cleanup()
 
 
-class TCPRequestHandler(socketserver.BaseRequestHandler):
-    def __init__(self):
-        super(TCPRequestHandler, self).__init__()
-        self.daqHandler = DAQHandler() 
+
+
+
+
+
+#Handles TCP server requests - once connected the server reads from the daq, waits for a handshake/command, and 
+class DAQRequestHandler(StreamRequestHandler):
+    def __init__(self, daq):
+        # super(DAQRequestHandler, self).__init__()
+        self.daq = daq
+
+
+    #Override to call function - calls init class and inputs the read queue 
+    def __call__(self, request, client_address, server):
+        h = DAQRequestHandler(self.daq)
+        StreamRequestHandler.__init__(h, request, client_address, server)
+
+
+    def handle(self):
+        print(f"[DAQ Server] Client connected: {self.client_address[0]}:{self.client_address[1]}")
+
+        #Create BytesIO object to handle sending/receiving data
+        stream = io.BytesIO()
+
+      
+        while True: 
+            #Send data to stream
+            self.send_data(stream)
+
+            #Read handshake/command
+            self.read_command()
+
+
+    def send_data(self, stream):
+        #Create numpy array from DAQ data
+        data = self.daq.read_data() 
 
     
-    def handle(self):
+        #Tell the client the length of the data (uses stream object to do this)
+        stream.write(data)
+        self.wfile.write(struct.pack('<L', stream.tell()))
+        self.wfile.flush()
+        stream.seek(0)
+
+        #Send data as double
+        self.wfile.write(stream.read())
+        stream.seek(0)
+        stream.truncate()
+        self.wfile.flush()
+
+    def read_command(self):
+        data_len = struct.unpack('<L', self.rfile.read(struct.calcsize('<L')))[0]
+        response = np.frombuffer(self.rfile.read(data_len), dtype = 'uint8')
+
+        #Save data if the array reads 1
+        if response[0] == 1:
+            self.on_save_command()
         
-        while True:
-            data = self.daqHandler.read_data() 
-            
-            # self.wfile.write(data)
-            self.request.sendall(data)
-        
-        # data = str(self.request.recv(1024), 'ascii')
-        # cur_thread = threading.current_thread()
-        # response = bytes("{}: {}".format(cur_thread.name, data), 'ascii')
-        self.request.sendall(response)
 
 
+    def on_save_command(self):
+        print(f"[DAQ Server] Client sent save command: {self.client_address[0]}:{self.client_address[1]}")
 
-
-def create_server():
-    HOST, PORT = "localhost", 9999
-
-    # Create the server, binding to localhost on port 9999
-    with socketserver.ThreadedTCPServer((HOST, PORT), TCPRequestHandler) as server:
-        # Activate the server; this will keep running until you
-        # interrupt the program with Ctrl-C
-        server.serve_forever()
-
-
-
-
+        self.daq.record_data()
 
 def main():
-    #Setup the DAQ
-    daqHandler = DAQHandler()    
+    #Initialize data acquisition device 
+    daq = DAQHandler()
 
-    #Create header for CSV file
-    with open(OUTPUT_FILE, 'w') as f:      
-        f.write("Timestamp,Sound Lvl ch.0 (V),Sound Lvl ch.1 (V),Sound Lvl ch.2 (V),Sound Lvl ch.3 (V)\n")
-
-
-    try:
-        # # wait for the external trigger to occur
-        # print('\nWaiting for trigger ... hit Ctrl-C to cancel the trigger')
-        # wait_for_trigger(hat)
-
-        print('\nStarting scan ... Press Ctrl-C to stop\n')
-
-        # Display the header row for the data table.
-        print('Samples Read    Scan Count', end='')
-        for chan in CHANNELS:
-            print('    Channel ', chan, sep='', end='')
-        print('')
-
-        daqHandler.read_and_display_data()
-
-    #Stop on ctrl+c
-    except KeyboardInterrupt:   
-        print('Stopping')
+    #Local host
+    HOST = '0.0.0.0'
     
-    #Stop and cleanup daq
-    daqHandler.stop_hat()
+    #Create server
+    print('Creating server %s:%s'%(HOST, PORT))
+
+    server = ThreadingTCPServer((HOST, PORT), DAQRequestHandler(daq), False)
+    
+    #Fix for when server shuts down inproperly - enables rebinding to the same address
+    server.allow_reuse_address = True 
+    server.server_bind() 
+    server.server_activate() 
+
+    #Start server 
+    server.serve_forever()
 
 
 #Run if file is ran directly
 if __name__ == "__main__":
     main() 
 
-
-
-
-# if __name__ == "__main__":
-#     # Port 0 means to select an arbitrary unused port
-#     HOST, PORT = "localhost", 0
-
-#     server = ThreadedTCPServer((HOST, PORT), ThreadedTCPRequestHandler)
-#     with server:
-#         ip, port = server.server_address
-
-#         # Start a thread with the server -- that thread will then start one
-#         # more thread for each request
-#         server_thread = threading.Thread(target=server.serve_forever)
-#         # Exit the server thread when the main thread terminates
-#         server_thread.daemon = True
-#         server_thread.start()
-#         print("Server loop running in thread:", server_thread.name)
-
-#         client(ip, port, "Hello World 1")
-#         client(ip, port, "Hello World 2")
-#         client(ip, port, "Hello World 3")
-
-#         server.shutdown()

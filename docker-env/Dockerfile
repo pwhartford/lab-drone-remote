@@ -10,6 +10,7 @@ ENV STARTDELAY=$STARTDELAY
 # Install MAVROS and some other dependencies for later
 RUN apt-get update && apt-get install -y ros-kinetic-mavros ros-kinetic-mavros-extras ros-kinetic-mavros-msgs vim wget screen
 RUN apt install -y ssh 
+RUN apt-get install python-catkin-tools python-rosinstall-generator -y
 
 # Dependency from https://github.com/mavlink/mavros/blob/master/mavros/README.md
 RUN wget https://raw.githubusercontent.com/mavlink/mavros/master/mavros/scripts/install_geographiclib_datasets.sh
