@@ -1,0 +1,2 @@
+
+-DCATKIN_DEVEL_PREFIX=/lab-drone-remote/drone-control/catkin_ws/devel -DCMAKE_INSTALL_PREFIX=/lab-drone-remote/drone-control/catkin_ws/install -G Unix Makefiles
