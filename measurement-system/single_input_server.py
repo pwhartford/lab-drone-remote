@@ -68,6 +68,7 @@ class DAQHandler():
         self.channelMask = chan_list_to_mask(self.channels)
         self.numChannels = len(self.channels)
 
+        
         #Set input mode to single channel (range is +/-5V)
         inputMode = AnalogInputMode.SE
         inputRange = AnalogInputRange.BIP_5V
@@ -85,10 +86,10 @@ class DAQHandler():
         #Set continuous scan
         self.options = OptionFlags.CONTINUOUS
 
-        self.set_sample_rate()
+        self.set_daq_settings()
 
 
-    def set_sample_rate(self):
+    def set_daq_settings(self):
         print('\n [DAQ] Selected MCC 128 HAT device at address', self.address)
 
         actualScanRate = self.hat.a_in_scan_actual_rate(self.numChannels, self.sampleFrequency)
@@ -103,7 +104,16 @@ class DAQHandler():
         self.hat.a_in_scan_start(self.channelMask, self.sampleNumber, self.sampleFrequency,
                                 self.options)
 
+    def change_channel_settings(self, channelList):
+        self.channels = channelList
+        self.channelMask = chan_list_to_mask(self.channels)
+        self.numChannels = len(self.channels)
 
+        #Stop the hat 
+        self.stop_hat()
+
+        #Start again
+        self.set_daq_settings()
 
     def change_sample_settings(self, sampleFrequency, sampleNumber):
         self.sampleFrequency = sampleFrequency
@@ -113,17 +123,17 @@ class DAQHandler():
         self.stop_hat()
 
         #Set the sample rate and start again
-        self.set_sample_rate()
+        self.set_daq_settings()
 
 
-    def read_data(self, sampleNumber):
+    def read_data(self):
         """This is a single read request, need to specify number for proper sample freuquency """
 
         #Hardcoded read parameter 
-        timeout = sampleNumber*self.sampleFrequency + 1 #Set the timeout to be a little more than the sample time 
+        timeout = self.sampleNumber*self.sampleFrequency + 1 #Set the timeout to be a little more than the sample time 
         
         #Read from the DAQ
-        readResult = self.hat.a_in_scan_read(sampleNumber, self.sampleFrequency)
+        readResult = self.hat.a_in_scan_read(self.sampleNumber, self.sampleFrequency)
 
         # Check for an overrun error - return 1 if error happens
         if readResult.hardware_overrun:
@@ -140,24 +150,12 @@ class DAQHandler():
 
 
         #Create time array 
-        timeArray = np.linspace(0, SAMPLE_NUMBER/SAMPLE_FREQUENCY, SAMPLE_NUMBER)
+        timeArray = np.linspace(0, self.sampleNumber/self.sampleFrequency, self.sampleNumber)
 
         #Needs to be reshaped like this specifically - otherwise each channel is a cycle of the others (i.e. (4,1000))
-        dataArray = np.array(readResult.data).reshape(len(CHANNELS), SAMPLE_NUMBER)
+        dataArray = np.array(readResult.data).reshape(self.numChannels, self.sampleNumber)
 
         return timeArray, dataArray
-
-    def read_spectrum(self, binNumber):
-        #Hardcoded read parameter 
-        timeArray, dataArray = self.read_data()
-        #Create zero array with data
-        welchOutput, welchFrequency = signal.welch(dataArray[0,:], fs = SAMPLE_FREQUENCY, nperseg = NPERSEG)
-        welchOutput = np.zeros((len(CHANNELS), welchOutput.shape[0])) 
-
-        for ii, data in enumerate(dataArray):
-            welchOutput[ii,:], _ = signal.welch(data, fs = SAMPLE_FREQUENCY, nperseg = NPERSEG)
-
-        return welchOutput, welchFrequency
 
 
     def record_data(self):
@@ -227,8 +225,8 @@ class DAQRequestHandler(StreamRequestHandler):
         stream = io.BytesIO()
 
         #Send the channel info and sample frequency/sample amount
-        self.send_data(stream, np.array(CHANNELS, dtype = 'float'))
-        self.send_data(stream, np.array([SAMPLE_FREQUENCY, SAMPLE_NUMBER]))
+        self.send_data(stream, np.array(self.daq.channels, dtype = 'float'))
+        self.send_data(stream, np.array([self.daq.sampleFrequency, self.daq.sampleNumber]))
 
 
         while True: 
@@ -253,8 +251,6 @@ class DAQRequestHandler(StreamRequestHandler):
         data_len = struct.unpack('<L', self.rfile.read(struct.calcsize('<L')))[0]
         response = np.frombuffer(self.rfile.read(data_len), dtype = 'float')
 
-        print(response)
-
         #Save data if the array reads 1
         if int(response[0]) == 0:
             self.on_stream_command()
@@ -264,10 +260,16 @@ class DAQRequestHandler(StreamRequestHandler):
 
         elif response[0]==2:
             self.on_parameter_command(response[1], response[2])
+
+        elif response[0]==3:
+            data_len = struct.unpack('<L', self.rfile.read(struct.calcsize('<L')))[0]
+            channels = np.frombuffer(self.rfile.read(data_len), dtype = 'uint8')
+
+            self.on_channel_command(channels)
         
 
     def on_stream_command(self):
-        timeArray, dataArray = self.daq.read_data(SAMPLE_NUMBER) 
+        timeArray, dataArray = self.daq.read_data() 
 
         stream = io.BytesIO()
 
@@ -285,7 +287,19 @@ class DAQRequestHandler(StreamRequestHandler):
 
         self.daq.change_sample_settings(sampleFrequency, sampleNumber)
 
-        self.on_stream_command()
+    
+    def on_channel_command(self, channels):
+        print(f"[DAQ Server] Client sent change channel command: {self.client_address[0]}:{self.client_address[1]}")
+        channelList = [int(channel) for channel in channels]
+        
+        self.daq.change_channel_settings(channels)
+
+        stream = io.BytesIO()
+
+        self.send_data(stream, np.array(channels, dtype = 'float'))
+        self.send_data(stream, np.array([self.daq.sampleFrequency, self.daq.sampleNumber]))
+
+
 
 def main():
     #Initialize data acquisition device 
